@@ -16,6 +16,16 @@
         ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
         .fade-in { animation: fadeIn 0.3s ease-in-out; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .upload-spinner {
+            border: 3px solid rgba(0, 0, 0, 0.1);
+            border-top: 3px solid #0d9488;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-900 font-sans overflow-hidden h-screen flex">
@@ -49,6 +59,9 @@
             getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, 
             onSnapshot, serverTimestamp, query, orderBy 
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import {
+            getStorage, ref, uploadBytes, getDownloadURL, deleteObject
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-storage.js";
 
         // --- Configuration ---
         const firebaseConfig = {
@@ -64,6 +77,7 @@
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
+        const storage = getStorage(app);
 
         // --- State Management ---
         const state = {
@@ -73,6 +87,7 @@
             sidebarOpen: true,
             activeProject: null,
             projectSubTab: 'overview',
+            isUploading: false,
             
             // Data
             hotlinks: [],
@@ -92,7 +107,6 @@
                 state.view = 'dashboard';
                 setupListeners(user.uid);
             } else {
-                // Clear data on logout
                 if (state.unsubHotlinks) state.unsubHotlinks();
                 if (state.unsubProjects) state.unsubProjects();
                 if (state.unsubFiles) state.unsubFiles();
@@ -106,18 +120,15 @@
         });
 
         function setupListeners(uid) {
-            // Hotlinks Listener
             const hotlinksRef = collection(db, 'users', uid, 'hotlinks');
             state.unsubHotlinks = onSnapshot(hotlinksRef, (snap) => {
                 state.hotlinks = snap.docs.map(d => ({id: d.id, ...d.data()}));
                 render();
             });
 
-            // Projects Listener
             const projectsRef = query(collection(db, 'users', uid, 'projects'), orderBy('createdAt', 'desc'));
             state.unsubProjects = onSnapshot(projectsRef, (snap) => {
                 state.projects = snap.docs.map(d => ({id: d.id, ...d.data()}));
-                // Update active project reference if it exists to keep it fresh
                 if (state.activeProject) {
                     const fresh = state.projects.find(p => p.id === state.activeProject.id);
                     if (fresh) state.activeProject = fresh;
@@ -130,10 +141,8 @@
             });
         }
 
-        // Setup Files Listener
         function setupFileListener(projectId) {
             if (state.unsubFiles) state.unsubFiles();
-            
             const filesRef = query(collection(db, 'users', state.user.uid, 'projects', projectId, 'files'), orderBy('createdAt', 'desc'));
             state.unsubFiles = onSnapshot(filesRef, (snap) => {
                 state.activeProjectFiles = snap.docs.map(d => ({id: d.id, ...d.data()}));
@@ -142,9 +151,7 @@
         }
 
         // --- Actions ---
-
         window.actions = {
-            // Auth Actions
             toggleAuthMode: () => {
                 state.authMode = state.authMode === 'login' ? 'signup' : 'login';
                 render();
@@ -167,7 +174,6 @@
                     } else {
                         await signInWithEmailAndPassword(auth, email, password);
                     }
-                    // onAuthStateChanged will handle the redirect
                 } catch (err) {
                     console.error(err);
                     errorDiv.textContent = formatAuthError(err.code);
@@ -181,7 +187,6 @@
                 await signOut(auth);
             },
 
-            // Navigation Actions
             toggleSidebar: () => {
                 state.sidebarOpen = !state.sidebarOpen;
                 render();
@@ -206,22 +211,21 @@
                 render();
             },
 
-            // Modal Handlers
             openModal: (type) => {
                 const overlay = document.getElementById('modal-overlay');
                 const content = document.getElementById('modal-content');
                 overlay.classList.remove('hidden');
                 content.innerHTML = getModalContent(type);
+                lucide.createIcons();
             },
 
             closeModal: () => {
+                if (state.isUploading) return;
                 document.getElementById('modal-overlay').classList.add('hidden');
             },
 
-            // Data Operations
             addHotlink: async (e) => {
                 e.preventDefault();
-                // Get selected color
                 const colorInputs = document.getElementsByName('color');
                 let selectedColor = 'bg-white border-slate-200';
                 for(let input of colorInputs) {
@@ -259,7 +263,10 @@
             },
 
             deleteProject: async (id) => {
-                if(confirm('Delete project and all data?')) await deleteDoc(doc(db, 'users', state.user.uid, 'projects', id));
+                if(confirm('Delete project and all data?')) {
+                    // Note: In a production app, we would also loop through and delete files in Storage
+                    await deleteDoc(doc(db, 'users', state.user.uid, 'projects', id));
+                }
             },
 
             addResource: async (e) => {
@@ -277,29 +284,76 @@
 
             triggerFileUpload: () => document.getElementById('file-upload-input').click(),
 
-            handleFileUpload: (input) => {
+            handleFileUpload: async (input) => {
                 const file = input.files[0];
                 if (!file) return;
-                if (file.size > 1024 * 1024) { alert('File too large. Max 1MB allowed.'); return; }
                 
-                const reader = new FileReader();
-                reader.onload = async (e) => {
+                state.isUploading = true;
+                const uploadContainer = document.getElementById('upload-ui-container');
+                if (uploadContainer) {
+                    uploadContainer.innerHTML = `
+                        <div class="flex flex-col items-center py-8">
+                            <div class="upload-spinner mb-4"></div>
+                            <p class="text-sm font-medium text-slate-700">Uploading "${file.name}"...</p>
+                            <p class="text-xs text-slate-400 mt-1">This may take a moment for large files.</p>
+                        </div>
+                    `;
+                }
+
+                try {
+                    // 1. Define storage path
+                    const fileId = crypto.randomUUID();
+                    const storagePath = `users/${state.user.uid}/projects/${state.activeProject.id}/${fileId}_${file.name}`;
+                    const storageRef = ref(storage, storagePath);
+
+                    // 2. Upload to Cloud Storage
+                    await uploadBytes(storageRef, file);
+                    const downloadUrl = await getDownloadURL(storageRef);
+
+                    // 3. Save metadata to Firestore
                     await addDoc(collection(db, 'users', state.user.uid, 'projects', state.activeProject.id, 'files'), {
-                        name: file.name, type: file.type, size: file.size, data: e.target.result, createdAt: serverTimestamp()
+                        name: file.name, 
+                        type: file.type, 
+                        size: file.size, 
+                        url: downloadUrl,
+                        storagePath: storagePath,
+                        createdAt: serverTimestamp()
                     });
+
+                    state.isUploading = false;
                     window.actions.closeModal();
-                };
-                reader.readAsDataURL(file);
+                } catch (error) {
+                    console.error("Upload failed", error);
+                    alert("Upload failed. Please try again.");
+                    state.isUploading = false;
+                    window.actions.closeModal();
+                }
             },
 
-            deleteFile: async (fileId) => {
-                if(confirm('Delete file permanently?')) await deleteDoc(doc(db, 'users', state.user.uid, 'projects', state.activeProject.id, 'files', fileId));
+            deleteFile: async (fileId, storagePath) => {
+                if(!confirm('Delete file permanently?')) return;
+                
+                try {
+                    // Delete from storage if path exists
+                    if (storagePath) {
+                        const fileRef = ref(storage, storagePath);
+                        await deleteObject(fileRef).catch(e => console.warn("Storage delete failed", e));
+                    }
+                    // Delete doc from firestore
+                    await deleteDoc(doc(db, 'users', state.user.uid, 'projects', state.activeProject.id, 'files', fileId));
+                } catch (error) {
+                    console.error("Delete failed", error);
+                }
             },
 
-            downloadFile: (data, name) => {
+            downloadFile: (url, name, legacyData) => {
                 const link = document.createElement('a');
-                link.href = data; link.download = name;
-                document.body.appendChild(link); link.click(); document.body.removeChild(link);
+                link.href = url || legacyData; 
+                link.download = name;
+                link.target = "_blank";
+                document.body.appendChild(link); 
+                link.click(); 
+                document.body.removeChild(link);
             }
         };
 
@@ -325,13 +379,18 @@
             }
         }
 
-        // --- DOM Rendering ---
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
 
+        // --- DOM Rendering ---
         function render() {
             const app = document.getElementById('app');
-
-            if (state.view === 'loading') return; // Keep loading spinner
-
+            if (state.view === 'loading') return;
             if (state.view === 'login') {
                 app.innerHTML = renderLogin();
             } else {
@@ -362,22 +421,18 @@
                     
                     <form onsubmit="actions.handleAuth(event)" class="space-y-4">
                         <div id="auth-error" class="hidden bg-red-50 text-red-600 text-sm p-3 rounded-md border border-red-200"></div>
-                        
                         <div>
                             <label class="block text-sm font-medium text-slate-700 mb-1">Email Address</label>
                             <input type="email" name="email" required class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent outline-none transition-all" placeholder="you@example.com">
                         </div>
-                        
                         <div>
                             <label class="block text-sm font-medium text-slate-700 mb-1">Password</label>
                             <input type="password" name="password" required minlength="6" class="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent outline-none transition-all" placeholder="••••••••">
                         </div>
-
                         <button type="submit" id="auth-btn" class="w-full bg-teal-600 hover:bg-teal-700 text-white font-semibold py-2.5 rounded-lg transition-all duration-200 shadow-sm mt-2">
                             ${isLogin ? 'Sign In' : 'Create Account'}
                         </button>
                     </form>
-
                     <div class="mt-6 text-center text-sm text-slate-500">
                         <span>${isLogin ? "Don't have an account?" : "Already have an account?"}</span>
                         <button onclick="actions.toggleAuthMode()" class="text-teal-600 font-semibold hover:underline ml-1">
@@ -391,7 +446,6 @@
         function renderSidebar() {
             const widthClass = state.sidebarOpen ? 'w-64' : 'w-16';
             const hideText = !state.sidebarOpen ? 'hidden' : '';
-            
             return `
             <div class="bg-slate-900 text-slate-300 flex-shrink-0 transition-all duration-300 flex flex-col ${widthClass}">
                 <div class="h-16 flex items-center px-4 border-b border-slate-800">
@@ -400,17 +454,14 @@
                     </div>
                     <span class="ml-3 font-bold text-white tracking-tight ${hideText}">Scholar<span class="text-teal-500">Dash</span></span>
                 </div>
-
                 <div class="p-3 space-y-1 flex-1 overflow-y-auto">
                     <button onclick="actions.setView('dashboard')" class="w-full flex items-center gap-3 px-3 py-2 rounded-md transition-colors ${state.view === 'dashboard' ? 'bg-slate-800 text-white' : 'hover:bg-slate-800 hover:text-white'}">
                         <i data-lucide="activity" class="w-5 h-5"></i>
                         <span class="${hideText}">Dashboard</span>
                     </button>
-
                     <div class="mt-8 mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-slate-500 ${hideText}">
                         Recent Projects
                     </div>
-                    
                     ${state.projects.slice(0, 5).map(p => `
                         <button onclick="actions.setView('project-detail', ${JSON.stringify(p).replace(/"/g, '&quot;')})" 
                             class="w-full flex items-center gap-3 px-3 py-2 rounded-md transition-colors ${state.activeProject?.id === p.id ? 'bg-teal-900/50 text-teal-400' : 'hover:bg-slate-800 hover:text-white'}" title="${p.title}">
@@ -419,14 +470,12 @@
                         </button>
                     `).join('')}
                 </div>
-
                 <div class="p-3 border-t border-slate-800">
                     <button onclick="actions.logout()" class="w-full flex items-center gap-3 px-3 py-2 rounded-md text-red-400 hover:bg-slate-800 hover:text-red-300 transition-colors">
                         <i data-lucide="log-out" class="w-5 h-5"></i>
                         <span class="${hideText}">Sign Out</span>
                     </button>
                 </div>
-
                 <div class="p-4 border-t border-slate-800">
                     <button onclick="actions.toggleSidebar()" class="flex items-center gap-3 text-slate-400 hover:text-white transition-colors">
                         <i data-lucide="menu" class="w-5 h-5"></i>
@@ -439,7 +488,6 @@
         function renderDashboard() {
             const activeCount = state.projects.filter(p => p.status === 'Active').length;
             const dateStr = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-
             return `
             <div class="max-w-5xl mx-auto p-8 space-y-8 fade-in">
                 <header class="flex justify-between items-end pb-6 border-b border-slate-200">
@@ -452,7 +500,6 @@
                         <span class="text-xs text-slate-400 block mt-1">${state.user.email}</span>
                     </div>
                 </header>
-
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div class="bg-white p-6 rounded-lg border border-slate-200 shadow-sm flex items-center gap-4">
                         <div class="w-12 h-12 rounded-full bg-teal-50 text-teal-600 flex items-center justify-center"><i data-lucide="folder"></i></div>
@@ -467,7 +514,6 @@
                         <div><div class="text-2xl font-bold text-slate-800">${state.hotlinks.length}</div><div class="text-sm text-slate-500">Quick Links</div></div>
                     </div>
                 </div>
-
                 <section>
                     <div class="flex justify-between items-center mb-4">
                         <h2 class="text-lg font-bold text-slate-800">Quick Access</h2>
@@ -493,7 +539,6 @@
                         </button>
                     </div>
                 </section>
-
                 <section>
                     <div class="flex justify-between items-center mb-4">
                         <h2 class="text-lg font-bold text-slate-800">All Projects</h2>
@@ -524,7 +569,6 @@
 
         function renderProjectDetail() {
             const p = state.activeProject;
-            
             const renderOverview = () => `
                 <div class="max-w-3xl">
                     <div class="bg-white rounded-lg shadow-sm border border-slate-200 p-6 mb-6">
@@ -532,7 +576,6 @@
                         <p class="text-slate-600 leading-relaxed whitespace-pre-wrap">${p.description || "No description provided."}</p>
                     </div>
                 </div>`;
-
             const renderResources = () => `
                 <div class="max-w-4xl">
                     <div class="flex justify-between items-center mb-6">
@@ -561,7 +604,6 @@
                         </table>
                     </div>
                 </div>`;
-
             const renderFiles = () => `
                 <div class="max-w-4xl">
                     <div class="flex justify-between items-center mb-6">
@@ -582,11 +624,11 @@
                                 ${state.activeProjectFiles.map(f => `
                                     <tr class="hover:bg-slate-50">
                                         <td class="px-6 py-4 font-medium text-slate-800 flex items-center gap-2"><i data-lucide="file" class="w-4 h-4 text-slate-400"></i> ${f.name}</td>
-                                        <td class="px-6 py-4 text-slate-500">${(f.size/1024).toFixed(1)} KB</td>
+                                        <td class="px-6 py-4 text-slate-500">${formatSize(f.size)}</td>
                                         <td class="px-6 py-4 text-right">
                                             <div class="flex justify-end gap-3">
-                                                <button onclick="actions.downloadFile('${f.data}', '${f.name}')" class="text-slate-400 hover:text-teal-600"><i data-lucide="download" class="w-4 h-4"></i></button>
-                                                <button onclick="actions.deleteFile('${f.id}')" class="text-slate-400 hover:text-red-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                                                <button onclick="actions.downloadFile('${f.url}', '${f.name}', '${f.data || ''}')" class="text-slate-400 hover:text-teal-600"><i data-lucide="download" class="w-4 h-4"></i></button>
+                                                <button onclick="actions.deleteFile('${f.id}', '${f.storagePath || ''}')" class="text-slate-400 hover:text-red-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
                                             </div>
                                         </td>
                                     </tr>
@@ -595,13 +637,11 @@
                         </table>
                     </div>
                 </div>`;
-
             const getSubContent = () => {
                 if (state.projectSubTab === 'resources') return renderResources();
                 if (state.projectSubTab === 'files') return renderFiles();
                 return renderOverview();
             };
-
             return `
             <div class="flex flex-col h-full fade-in">
                 <div class="bg-white border-b border-slate-200 px-8 py-6 flex justify-between items-start">
@@ -624,7 +664,6 @@
                     </div>
                     <button onclick="actions.deleteProject('${p.id}')" class="text-sm text-red-600 hover:text-red-800 px-3 py-1.5 border border-red-200 rounded hover:bg-red-50">Delete Project</button>
                 </div>
-                
                 <div class="bg-white border-b border-slate-200 px-8 flex gap-6">
                     ${['overview', 'resources', 'files'].map(t => `
                         <button onclick="actions.setSubTab('${t}')" class="py-4 text-sm font-medium border-b-2 transition-colors capitalize ${state.projectSubTab === t ? 'border-teal-600 text-teal-700' : 'border-transparent text-slate-500 hover:text-slate-700'}">
@@ -632,14 +671,12 @@
                         </button>
                     `).join('')}
                 </div>
-
                 <div class="flex-1 overflow-y-auto bg-slate-50 p-8">
                     ${getSubContent()}
                 </div>
             </div>`;
         }
 
-        // --- Modal Templates ---
         function getModalContent(type) {
             const header = (title) => `<div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50"><h3 class="font-semibold text-slate-800">${title}</h3><button onclick="actions.closeModal()" class="text-slate-400 hover:text-slate-600"><i data-lucide="x"></i></button></div>`;
             const footer = (btnText) => `<div class="flex justify-end gap-2 mt-6"><button type="button" onclick="actions.closeModal()" class="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-md text-sm">Cancel</button><button type="submit" class="px-4 py-2 bg-teal-700 text-white hover:bg-teal-800 rounded-md text-sm">${btnText}</button></div>`;
@@ -651,37 +688,17 @@
                     <div class="p-6">
                         <div class="mb-4"><label class="block text-xs font-semibold uppercase text-slate-500 mb-1">Title</label><input name="title" required class="w-full px-3 py-2 border rounded-md" placeholder="e.g. PubMed"></div>
                         <div class="mb-4"><label class="block text-xs font-semibold uppercase text-slate-500 mb-1">URL</label><input name="url" required class="w-full px-3 py-2 border rounded-md" placeholder="https://..."></div>
-                        
                         <div class="mb-4">
                             <label class="block text-xs font-semibold uppercase text-slate-500 mb-2">Color Appearance</label>
                             <div class="flex gap-2">
-                                <label class="cursor-pointer">
-                                    <input type="radio" name="color" value="bg-white border-slate-200" checked class="peer sr-only">
-                                    <div class="w-8 h-8 rounded-full bg-white border border-slate-300 peer-checked:ring-2 peer-checked:ring-slate-400"></div>
-                                </label>
-                                <label class="cursor-pointer">
-                                    <input type="radio" name="color" value="bg-red-50 border-red-100" class="peer sr-only">
-                                    <div class="w-8 h-8 rounded-full bg-red-50 border border-red-200 peer-checked:ring-2 peer-checked:ring-red-400"></div>
-                                </label>
-                                <label class="cursor-pointer">
-                                    <input type="radio" name="color" value="bg-orange-50 border-orange-100" class="peer sr-only">
-                                    <div class="w-8 h-8 rounded-full bg-orange-50 border border-orange-200 peer-checked:ring-2 peer-checked:ring-orange-400"></div>
-                                </label>
-                                <label class="cursor-pointer">
-                                    <input type="radio" name="color" value="bg-green-50 border-green-100" class="peer sr-only">
-                                    <div class="w-8 h-8 rounded-full bg-green-50 border border-green-200 peer-checked:ring-2 peer-checked:ring-green-400"></div>
-                                </label>
-                                <label class="cursor-pointer">
-                                    <input type="radio" name="color" value="bg-blue-50 border-blue-100" class="peer sr-only">
-                                    <div class="w-8 h-8 rounded-full bg-blue-50 border border-blue-200 peer-checked:ring-2 peer-checked:ring-blue-400"></div>
-                                </label>
-                                <label class="cursor-pointer">
-                                    <input type="radio" name="color" value="bg-purple-50 border-purple-100" class="peer sr-only">
-                                    <div class="w-8 h-8 rounded-full bg-purple-50 border border-purple-200 peer-checked:ring-2 peer-checked:ring-purple-400"></div>
-                                </label>
+                                <label class="cursor-pointer"><input type="radio" name="color" value="bg-white border-slate-200" checked class="peer sr-only"><div class="w-8 h-8 rounded-full bg-white border border-slate-300 peer-checked:ring-2 peer-checked:ring-slate-400"></div></label>
+                                <label class="cursor-pointer"><input type="radio" name="color" value="bg-red-50 border-red-100" class="peer sr-only"><div class="w-8 h-8 rounded-full bg-red-50 border border-red-200 peer-checked:ring-2 peer-checked:ring-red-400"></div></label>
+                                <label class="cursor-pointer"><input type="radio" name="color" value="bg-orange-50 border-orange-100" class="peer sr-only"><div class="w-8 h-8 rounded-full bg-orange-50 border border-orange-200 peer-checked:ring-2 peer-checked:ring-orange-400"></div></label>
+                                <label class="cursor-pointer"><input type="radio" name="color" value="bg-green-50 border-green-100" class="peer sr-only"><div class="w-8 h-8 rounded-full bg-green-50 border border-green-200 peer-checked:ring-2 peer-checked:ring-green-400"></div></label>
+                                <label class="cursor-pointer"><input type="radio" name="color" value="bg-blue-50 border-blue-100" class="peer sr-only"><div class="w-8 h-8 rounded-full bg-blue-50 border border-blue-200 peer-checked:ring-2 peer-checked:ring-blue-400"></div></label>
+                                <label class="cursor-pointer"><input type="radio" name="color" value="bg-purple-50 border-purple-100" class="peer sr-only"><div class="w-8 h-8 rounded-full bg-purple-50 border border-purple-200 peer-checked:ring-2 peer-checked:ring-purple-400"></div></label>
                             </div>
                         </div>
-
                         ${footer('Add Link')}
                     </div>
                 </form>`;
@@ -711,13 +728,13 @@
             }
             if (type === 'file') {
                 return `
-                <div>
+                <div id="upload-ui-container">
                     ${header('Upload File')}
                     <div class="p-6 text-center">
                         <div onclick="actions.triggerFileUpload()" class="border-2 border-dashed border-slate-300 rounded-lg p-8 mb-4 cursor-pointer hover:bg-slate-50 transition-colors">
                             <i data-lucide="upload" class="mx-auto text-slate-400 mb-4 w-12 h-12"></i>
                             <p class="text-sm text-slate-600 mb-2">Click to select file</p>
-                            <p class="text-xs text-slate-400">Max 1MB (Firestore Limit)</p>
+                            <p class="text-xs text-slate-400 italic">No upload size limit</p>
                             <input type="file" id="file-upload-input" class="hidden" onchange="actions.handleFileUpload(this)">
                         </div>
                         <button onclick="actions.closeModal()" class="text-sm text-slate-500 hover:text-slate-700">Cancel</button>
